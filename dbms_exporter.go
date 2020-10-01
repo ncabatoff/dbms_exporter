@@ -1,13 +1,13 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"math"
 	"net/http"
 	"os"
 	"strings"
 	"time"
+	"runtime"
 
 	_ "net/http/pprof"
 
@@ -17,42 +17,21 @@ import (
 	"github.com/ncabatoff/dbms_exporter/recipes"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
+	"gopkg.in/alecthomas/kingpin.v2"
 )
 
 // Version is set at build time use ldflags.
 var Version string
 
 var (
-	version       = flag.Bool("version", false, "print version and exit")
-	listenAddress = flag.String(
-		"web.listen-address", ":9113",
-		"Address to listen on for web interface and telemetry.",
-	)
-	metricPath = flag.String(
-		"web.telemetry-path", "/metrics",
-		"Path under which to expose metrics.",
-	)
-	queriesPath = flag.String(
-		"queryfile", "",
-		"File with queries to run.",
-	)
-	onlyDumpMaps = flag.Bool(
-		"dumpmaps", false,
-		"Do not run, simply dump the maps.",
-	)
-	driver = flag.String(
-		"driver", "postgres",
-		"DB driver to user, one of ("+strings.Join(db.Drivers(), ",")+
-			"); sybase is the same as freetds except for the prefix of generated metrics)",
-	)
-	persistentConnection = flag.Bool(
-		"persistent.connection", false,
-		"keep a DB connection open rather than opening a new one for each scrape",
-	)
-	queryFatalTimeout = flag.Duration(
-		"scrape.fatal-timeout", 0,
-		"exit if a scrape takes this long to execute",
-	)
+	listenAddress          = kingpin.Flag("web.listen-address", "Address to listen on for web interface and telemetry.").Default(":9113").Envar("DBMS_EXPORTER_WEB_LISTEN_ADDRESS").String()
+	metricPath             = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").Envar("DBMS_EXPORTER_WEB_TELEMETRY_PATH").String()
+	queriesPath            = kingpin.Flag("queryfile", "Path to custom queries to run.").Default("").Envar("DBMS_EXPORTER_QUERYFILE").String()
+	onlyDumpMaps           = kingpin.Flag("dumpmaps", "Do not run, simply dump the maps.").Bool()
+	driver                 = kingpin.Flag("driver", "DB driver to user, one of ("+strings.Join(db.Drivers(), ",")+"); sybase is the same as freetds except for the prefix of generated metrics)").Default("postgres").Envar("DBMS_EXPORTER_DRIVER").String()
+	persistentConnection   = kingpin.Flag("persistent.connection", "keep a DB connection open rather than opening a new one for each scrape").Bool()
+	queryFatalTimeout      = kingpin.Flag("scrape.fatal-timeout", "exit if a scrape takes this long to execute").Duration()
+	constantLabelsList     = kingpin.Flag("constantLabels", "A list of label=value separated by comma(,).").Default("").Envar("DBMS_EXPORTER_CONSTANT_LABELS").String()
 )
 
 // Metric name parts.
@@ -88,12 +67,18 @@ type MetricMapNamespace struct {
 	columnMappings map[string]MetricMap // Column mappings in this namespace
 }
 
-func makeDescMap(metricName string, resultMap recipes.ResultMap, recipe recipes.MetricQueryRecipe) MetricMapNamespace {
+func makeDescMap(metricName string, resultMap recipes.ResultMap, recipe recipes.MetricQueryRecipe, constantLabels prometheus.Labels) MetricMapNamespace {
 	thisMap := make(map[string]MetricMap)
 
-	// Get the constant labels
+	// Get the per-metric constant labels by starting with server
+	// constant labels and adding any fixed labels to that
 	var variableLabels []string
 	var constLabels = make(prometheus.Labels)
+	// Copy from the original map to the target map
+	for key, value := range constantLabels {
+		constLabels[key] = value
+	}
+
 	for columnName, columnMapping := range resultMap {
 		if columnMapping.Usage == common.LABEL {
 			variableLabels = append(variableLabels, columnName)
@@ -183,7 +168,7 @@ func convertDuration(in interface{}) (float64, bool) {
 }
 
 // Turn the MetricMap column mapping into a prometheus descriptor mapping.
-func makeDescMaps(recipes []recipes.MetricQueryRecipe) map[string]MetricMapNamespace {
+func makeDescMaps(recipes []recipes.MetricQueryRecipe, constantLabels prometheus.Labels) map[string]MetricMapNamespace {
 	var metricMap = make(map[string]MetricMapNamespace)
 
 	for _, recipe := range recipes {
@@ -198,7 +183,7 @@ func makeDescMaps(recipes []recipes.MetricQueryRecipe) map[string]MetricMapNames
 				metricName = metricName + "_" + rm.Name
 			}
 
-			metricMap[metricName] = makeDescMap(metricName, rm.ResultMap, recipe)
+			metricMap[metricName] = makeDescMap(metricName, rm.ResultMap, recipe, constantLabels)
 		}
 	}
 
@@ -217,6 +202,7 @@ type Exporter struct {
 	persistentConnection bool
 	conn                 db.Conn
 	scrapeChan           chan scrapeRequest
+	constantLabels       prometheus.Labels
 	duration             prometheus.Gauge
 	totalScrapes         prometheus.Counter
 	errors_total         prometheus.Counter
@@ -228,7 +214,9 @@ type Exporter struct {
 }
 
 // NewExporter returns a new exporter for the provided DSN.
-func NewExporter(driver, dsn string, recipes []recipes.MetricQueryRecipe, persistentConn bool, fatalTimeout time.Duration) *Exporter {
+func NewExporter(driver, dsn string, recipes []recipes.MetricQueryRecipe, persistentConn bool, fatalTimeout time.Duration, constantLabelsList string) *Exporter {
+	constantLabels := parseConstLabels(constantLabelsList);
+
 	return &Exporter{
 		driver: driver,
 		dsn:    dsn,
@@ -237,37 +225,68 @@ func NewExporter(driver, dsn string, recipes []recipes.MetricQueryRecipe, persis
 			Subsystem: exporter,
 			Name:      "last_scrape_duration_seconds",
 			Help:      "Duration of the last scrape of metrics from DB",
+			ConstLabels: constantLabels,
 		}),
 		totalScrapes: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: driver,
 			Subsystem: exporter,
 			Name:      "scrapes_total",
 			Help:      "Total number of times the DB was scraped for metrics.",
+			ConstLabels: constantLabels,
 		}),
 		errors_total: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: driver,
 			Subsystem: exporter,
 			Name:      "scrape_errors_total",
 			Help:      "How many scrapes failed due to an error",
+			ConstLabels: constantLabels,
 		}),
 		open_seconds_total: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: driver,
 			Subsystem: exporter,
 			Name:      "open_seconds_total",
 			Help:      "How much time was consumed opening DB connections",
+			ConstLabels: constantLabels,
 		}),
 		query_seconds_total: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: driver,
 			Subsystem: exporter,
 			Name:      "query_seconds_total",
 			Help:      "How much time was consumed opening DB connections",
+			ConstLabels: constantLabels,
 		}, []string{"namespace"}),
-		metricMap:            makeDescMaps(recipes),
+		metricMap:            makeDescMaps(recipes, constantLabels),
 		recipes:              recipes,
 		persistentConnection: persistentConn,
 		scrapeChan:           make(chan scrapeRequest),
 		scrapeTimeoutFatal:   fatalTimeout,
 	}
+}
+
+func parseConstLabels(s string) prometheus.Labels {
+	labels := make(prometheus.Labels)
+
+	s = strings.TrimSpace(s)
+	if len(s) == 0 {
+		return labels
+	}
+
+	parts := strings.Split(s, ",")
+	for _, p := range parts {
+		keyValue := strings.Split(strings.TrimSpace(p), "=")
+		if len(keyValue) != 2 {
+			log.Errorf(`Wrong constant labels format %q, should be "key=value"`, p)
+			continue
+		}
+		key := strings.TrimSpace(keyValue[0])
+		value := strings.TrimSpace(keyValue[1])
+		if key == "" || value == "" {
+			continue
+		}
+		labels[key] = value
+	}
+
+	return labels
 }
 
 // Describe implements prometheus.Collector.
@@ -454,16 +473,10 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 }
 
 func main() {
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
-		flag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, usage)
-	}
-	flag.Parse()
-	if *version {
-		fmt.Printf("dbms-exporter version %s\n", Version)
-		os.Exit(0)
-	}
+	kingpin.Version(fmt.Sprintf("dbms_exporter %s (built with %s)\n", Version, runtime.Version()))
+	log.AddFlags(kingpin.CommandLine)
+	kingpin.UsageTemplate(kingpin.DefaultUsageTemplate + usage)
+	kingpin.Parse()
 
 	if *queriesPath == "" {
 		log.Fatalf("-queryfile is a required argument")
@@ -498,7 +511,7 @@ func main() {
 		log.Fatal("couldn't find environment variable DATA_SOURCE_NAME")
 	}
 
-	exporter := NewExporter(*driver, dsn, rcps, *persistentConnection, *queryFatalTimeout)
+	exporter := NewExporter(*driver, dsn, rcps, *persistentConnection, *queryFatalTimeout, *constantLabelsList)
 	exporter.Start()
 	prometheus.MustRegister(exporter)
 
