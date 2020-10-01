@@ -1,13 +1,13 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"math"
 	"net/http"
 	"os"
 	"strings"
 	"time"
+	"runtime"
 
 	_ "net/http/pprof"
 
@@ -17,42 +17,20 @@ import (
 	"github.com/ncabatoff/dbms_exporter/recipes"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
+	"gopkg.in/alecthomas/kingpin.v2"
 )
 
 // Version is set at build time use ldflags.
 var Version string
 
 var (
-	version       = flag.Bool("version", false, "print version and exit")
-	listenAddress = flag.String(
-		"web.listen-address", ":9113",
-		"Address to listen on for web interface and telemetry.",
-	)
-	metricPath = flag.String(
-		"web.telemetry-path", "/metrics",
-		"Path under which to expose metrics.",
-	)
-	queriesPath = flag.String(
-		"queryfile", "",
-		"File with queries to run.",
-	)
-	onlyDumpMaps = flag.Bool(
-		"dumpmaps", false,
-		"Do not run, simply dump the maps.",
-	)
-	driver = flag.String(
-		"driver", "postgres",
-		"DB driver to user, one of ("+strings.Join(db.Drivers(), ",")+
-			"); sybase is the same as freetds except for the prefix of generated metrics)",
-	)
-	persistentConnection = flag.Bool(
-		"persistent.connection", false,
-		"keep a DB connection open rather than opening a new one for each scrape",
-	)
-	queryFatalTimeout = flag.Duration(
-		"scrape.fatal-timeout", 0,
-		"exit if a scrape takes this long to execute",
-	)
+	listenAddress          = kingpin.Flag("web.listen-address", "Address to listen on for web interface and telemetry.").Default(":9113").Envar("DBMS_EXPORTER_WEB_LISTEN_ADDRESS").String()
+	metricPath             = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").Envar("DBMS_EXPORTER_WEB_TELEMETRY_PATH").String()
+	queriesPath            = kingpin.Flag("queryfile", "Path to custom queries to run.").Default("").Envar("DBMS_EXPORTER_QUERYFILE").String()
+	onlyDumpMaps           = kingpin.Flag("dumpmaps", "Do not run, simply dump the maps.").Bool()
+	driver                 = kingpin.Flag("driver", "DB driver to user, one of ("+strings.Join(db.Drivers(), ",")+"); sybase is the same as freetds except for the prefix of generated metrics)").Default("postgres").Envar("DBMS_EXPORTER_DRIVER").String()
+	persistentConnection   = kingpin.Flag("persistent.connection", "keep a DB connection open rather than opening a new one for each scrape").Bool()
+	queryFatalTimeout      = kingpin.Flag("scrape.fatal-timeout", "exit if a scrape takes this long to execute").Duration()
 )
 
 // Metric name parts.
@@ -454,16 +432,10 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 }
 
 func main() {
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
-		flag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, usage)
-	}
-	flag.Parse()
-	if *version {
-		fmt.Printf("dbms-exporter version %s\n", Version)
-		os.Exit(0)
-	}
+	kingpin.Version(fmt.Sprintf("dbms_exporter %s (built with %s)\n", Version, runtime.Version()))
+	log.AddFlags(kingpin.CommandLine)
+	kingpin.UsageTemplate(kingpin.DefaultUsageTemplate + usage)
+	kingpin.Parse()
 
 	if *queriesPath == "" {
 		log.Fatalf("-queryfile is a required argument")
