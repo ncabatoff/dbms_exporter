@@ -370,3 +370,6 @@ AS
 GRANT SELECT ON postgres_exporter.pg_stat_replication TO postgres_exporter;
 GRANT SELECT ON postgres_exporter.pg_stat_activity TO postgres_exporter;
 ```
+
+### Pour tester le resultat en local 
+curl http://localhost:9113/metrics
